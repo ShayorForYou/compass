@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Dial ring -->
+    <path
+        android:pathData="M54,54m-27,0a27,27 0,1 1,54 0a27,27 0,1 1,-54 0"
+        android:strokeWidth="2.5"
+        android:strokeColor="#66FFFFFF"
+        android:fillColor="#00000000" />
+    <!-- Cardinal dots -->
+    <path android:fillColor="#FFFF5A52" android:pathData="M54,27m-2.6,0a2.6,2.6 0,1 1,5.2 0a2.6,2.6 0,1 1,-5.2 0" />
+    <path android:fillColor="#CCFFFFFF" android:pathData="M81,54m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
+    <path android:fillColor="#CCFFFFFF" android:pathData="M54,81m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
+    <path android:fillColor="#CCFFFFFF" android:pathData="M27,54m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
+    <!-- Arrow -->
+    <path
+        android:pathData="M54,35 L68,70 L54,62 L40,70 Z"
+        android:fillColor="#FFFFFFFF"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.5"
+        android:strokeLineJoin="round" />
+</vector>
