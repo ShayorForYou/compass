@@ -8,13 +8,16 @@ import android.location.Address
 import android.location.Geocoder
 import android.location.Location
 import android.location.LocationManager
+import android.location.altitude.AltitudeConverter
 import android.os.Build
 import android.os.SystemClock
+import androidx.annotation.RequiresApi
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import androidx.core.location.LocationCompat
 import androidx.core.location.LocationListenerCompat
 import androidx.core.location.LocationManagerCompat
 import androidx.core.location.LocationRequestCompat
@@ -28,6 +31,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.coroutines.resume
+
+/** Altitude from a GPS fix. [aboveSeaLevel] is false when only the raw GPS (ellipsoid) height is known. */
+class GpsAltitude(val meters: Float, val accuracy: Float?, val aboveSeaLevel: Boolean)
 
 /**
  * Lightweight location source built on the platform LocationManager (no Play Services dependency).
@@ -44,6 +50,8 @@ class LocationTracker(private val context: Context, private val scope: Coroutine
         private set
     var address by mutableStateOf<String?>(null)
         private set
+    var altitude by mutableStateOf<GpsAltitude?>(null)
+        private set
     var permissionGranted by mutableStateOf(hasPermission())
         private set
     var locationEnabled by mutableStateOf(LocationManagerCompat.isLocationEnabled(locationManager))
@@ -53,6 +61,7 @@ class LocationTracker(private val context: Context, private val scope: Coroutine
     private var lastGeocoded: Location? = null
     private var lastGeocodeAttempt = 0L
     private var geocodeJob: Job? = null
+    private var altitudeJob: Job? = null
 
     private val listener = object : LocationListenerCompat {
         override fun onLocationChanged(location: Location) = onNewLocation(location)
@@ -132,6 +141,7 @@ class LocationTracker(private val context: Context, private val scope: Coroutine
         if (!isBetter(new, location)) return
         location = new
         locationEnabled = true
+        updateAltitude(new)
         val previous = lastGeocoded
         // A big jump makes the old address wrong; show coordinates until the new one resolves.
         if (previous != null && previous.distanceTo(new) > 1_000f) address = null
@@ -201,6 +211,53 @@ class LocationTracker(private val context: Context, private val scope: Coroutine
             .map { it.trim() }
             .filter { it.isNotEmpty() && seen.add(it.lowercase().replace(" ", "")) }
             .joinToString(", ")
+    }
+
+    /**
+     * GPS reports height above the WGS84 ellipsoid, which differs from sea level by up to ±100 m depending on
+     * where you are. Prefer a sea-level altitude from the provider; on Android 14+ the platform can convert one
+     * (off the main thread, cached geoid data); older devices fall back to the raw height.
+     */
+    private fun updateAltitude(fix: Location) {
+        if (!fix.hasAltitude()) return
+        val accuracy = if (LocationCompat.hasVerticalAccuracy(fix)) LocationCompat.getVerticalAccuracyMeters(fix) else null
+        when {
+            LocationCompat.hasMslAltitude(fix) -> altitude = GpsAltitude(
+                LocationCompat.getMslAltitudeMeters(fix).toFloat(),
+                if (LocationCompat.hasMslAltitudeAccuracy(fix)) LocationCompat.getMslAltitudeAccuracyMeters(fix) else accuracy,
+                aboveSeaLevel = true,
+            )
+
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> convertAltitude(fix, accuracy)
+
+            else -> altitude = GpsAltitude(fix.altitude.toFloat(), accuracy, aboveSeaLevel = false)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun convertAltitude(fix: Location, accuracy: Float?) {
+        if (altitudeJob?.isActive == true) return // Fixes arrive every few seconds; skipping one is harmless.
+        altitudeJob = scope.launch {
+            val msl = withContext(Dispatchers.IO) { MslConverter.convert(context, fix) }
+            altitude = if (msl != null) {
+                GpsAltitude(msl, accuracy, aboveSeaLevel = true)
+            } else {
+                GpsAltitude(fix.altitude.toFloat(), accuracy, aboveSeaLevel = false)
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private object MslConverter {
+        private val converter by lazy { AltitudeConverter() }
+
+        fun convert(context: Context, fix: Location): Float? = try {
+            val copy = Location(fix)
+            converter.addMslAltitudeToLocation(context, copy)
+            copy.mslAltitudeMeters.toFloat()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun isBetter(new: Location, current: Location?): Boolean {

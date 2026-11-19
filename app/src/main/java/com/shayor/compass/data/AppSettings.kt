@@ -29,6 +29,12 @@ class AppSettings(context: Context) {
         get() = _keepScreenOn
         set(value) { _keepScreenOn = value; prefs.edit { putBoolean(KEY_SCREEN_ON, value) } }
 
+    /** Animate at the display's full refresh rate (e.g. 120 Hz); off caps the app at 60 Hz to save battery. */
+    private var _smoothMotion by mutableStateOf(prefs.getBoolean(KEY_SMOOTH_MOTION, true))
+    var smoothMotion: Boolean
+        get() = _smoothMotion
+        set(value) { _smoothMotion = value; prefs.edit { putBoolean(KEY_SMOOTH_MOTION, value) } }
+
     private var _theme by mutableStateOf(
         ThemeMode.entries.getOrElse(prefs.getInt(KEY_THEME, 0)) { ThemeMode.SYSTEM }
     )
@@ -44,6 +50,7 @@ class AppSettings(context: Context) {
         const val KEY_TRUE_NORTH = "true_north"
         const val KEY_HAPTICS = "haptics"
         const val KEY_SCREEN_ON = "keep_screen_on"
+        const val KEY_SMOOTH_MOTION = "smooth_motion"
         const val KEY_THEME = "theme"
         const val KEY_ASKED_LOCATION = "asked_location"
     }

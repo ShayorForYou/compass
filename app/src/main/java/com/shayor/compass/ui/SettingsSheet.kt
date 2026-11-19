@@ -28,11 +28,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -42,17 +44,25 @@ import com.shayor.compass.data.AppSettings
 import com.shayor.compass.data.ThemeMode
 import com.shayor.compass.ui.theme.LocalCompassColors
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsSheet(
     settings: AppSettings,
     declination: Float?,
+    locationGranted: Boolean,
+    onRequestLocation: () -> Unit,
     onCalibrate: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val c = LocalCompassColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // Only offered on high-refresh displays; on a 60 Hz screen there is nothing to choose.
+    val view = LocalView.current
+    val maxRefreshRate = remember(view) {
+        view.display?.supportedModes?.maxOfOrNull { it.refreshRate }?.roundToInt() ?: 60
+    }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -86,11 +96,17 @@ fun SettingsSheet(
             Group {
                 ToggleRow(
                     title = "True north",
-                    subtitle = declination?.let {
-                        "Declination %.1f° %s".format(abs(it), if (it >= 0f) "E" else "W")
-                    } ?: "Requires location",
-                    checked = settings.trueNorth,
-                    onCheckedChange = { settings.trueNorth = it },
+                    subtitle = when {
+                        !locationGranted -> "Uses your location"
+                        declination == null -> "Waiting for location…"
+                        else -> "Declination %.1f° %s".format(abs(declination), if (declination >= 0f) "E" else "W")
+                    },
+                    checked = settings.trueNorth && locationGranted,
+                    onCheckedChange = {
+                        settings.trueNorth = it
+                        // Asked here, in context, rather than at launch.
+                        if (it && !locationGranted) onRequestLocation()
+                    },
                 )
                 Divider()
                 ToggleRow(
@@ -100,6 +116,15 @@ fun SettingsSheet(
                     onCheckedChange = { settings.haptics = it },
                 )
                 Divider()
+                if (maxRefreshRate > 60) {
+                    ToggleRow(
+                        title = "Smooth motion",
+                        subtitle = if (settings.smoothMotion) "$maxRefreshRate Hz" else "60 Hz · uses less battery",
+                        checked = settings.smoothMotion,
+                        onCheckedChange = { settings.smoothMotion = it },
+                    )
+                    Divider()
+                }
                 ToggleRow(
                     title = "Keep screen on",
                     subtitle = null,

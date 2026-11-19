@@ -15,6 +15,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.shayor.compass.sensor.CompassEngine
+import com.shayor.compass.sensor.HEADING_WAKE_DEG
+import com.shayor.compass.sensor.TILT_WAKE
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.roundToInt
@@ -39,8 +41,9 @@ private const val BUBBLE_RESPONSE = 7f
 
 /**
  * Pulls the latest sensor values on every vsync and eases the displayed values toward them with a
- * frame-rate independent exponential filter. When everything has settled the loop suspends until the next
- * sensor sample arrives, so a still phone costs no frames at all.
+ * frame-rate independent exponential filter. A value starts moving only once the sensor is past its wake
+ * threshold, then eases all the way to its target. When everything has settled the loop parks in the engine,
+ * which wakes it only for a real change, so a still phone costs no frames and almost no CPU.
  */
 @Composable
 fun SensorAnimationLoop(
@@ -59,6 +62,8 @@ fun SensorAnimationLoop(
             var lastNanos = 0L
             var firedLabel = -1
             var hapticsArmed = false
+            var headingMoving = true
+            var tiltMoving = true
             while (true) {
                 val now = withFrameNanos { it }
                 val dt = if (lastNanos == 0L) 1f / 60f else ((now - lastNanos) / 1e9f).coerceIn(0f, 0.1f)
@@ -69,7 +74,11 @@ fun SensorAnimationLoop(
                     val target = normalizeDegrees(engine.headingDegrees + offset)
                     val current = live.heading
                     val delta = shortestDelta(current, target)
-                    val next = if (abs(delta) < 0.01f) {
+                    if (abs(delta) >= HEADING_WAKE_DEG) headingMoving = true
+                    val next = if (!headingMoving) {
+                        current
+                    } else if (abs(delta) < 0.01f) {
+                        headingMoving = false
                         target
                     } else {
                         moving = true
@@ -104,18 +113,33 @@ fun SensorAnimationLoop(
                     val k = 1f - exp(-dt * BUBBLE_RESPONSE)
                     val dx = engine.tiltX - live.tiltX
                     val dy = engine.tiltY - live.tiltY
-                    if (abs(dx) > 1e-4f || abs(dy) > 1e-4f) {
+                    if (abs(dx) >= TILT_WAKE || abs(dy) >= TILT_WAKE) tiltMoving = true
+                    if (tiltMoving && (abs(dx) > 1e-4f || abs(dy) > 1e-4f)) {
                         live.tiltX += dx * k
                         live.tiltY += dy * k
                         moving = true
+                    } else {
+                        tiltMoving = false
                     }
                 }
 
                 if (!moving) {
-                    engine.awaitUpdate()
+                    do {
+                        val shown = if (live.directionIndex < 0) Float.NaN else normalizeDegrees(live.heading - offset)
+                        engine.awaitChange(shown, live.tiltX, live.tiltY)
+                    } while (!engine.needsFrame(live, offset))
                     lastNanos = 0L
                 }
             }
         }
     }
+}
+
+private fun CompassEngine.needsFrame(live: LiveReadings, offset: Float): Boolean {
+    if (hasHeading) {
+        if (live.directionIndex < 0) return true
+        val target = normalizeDegrees(headingDegrees + offset)
+        if (abs(shortestDelta(live.heading, target)) >= HEADING_WAKE_DEG) return true
+    }
+    return hasTilt && (abs(tiltX - live.tiltX) >= TILT_WAKE || abs(tiltY - live.tiltY) >= TILT_WAKE)
 }

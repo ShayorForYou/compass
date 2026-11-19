@@ -10,8 +10,14 @@ import android.os.HandlerThread
 import android.os.Process
 import android.view.Surface
 import kotlinx.coroutines.channels.Channel
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.sqrt
+
+// Wake thresholds for the UI. A resting phone's sensor noise stays below these, so it never costs a frame.
+// 0.15° is ~1 px at the dial's edge; 0.0015 of tilt is ~0.09°, under the level's 0.1° read-out.
+const val HEADING_WAKE_DEG = 0.15f
+const val TILT_WAKE = 0.0015f
 
 /**
  * Reads the motion sensors on a dedicated background thread and publishes the latest heading, tilt and
@@ -22,6 +28,8 @@ import kotlin.math.sqrt
  * accelerometer + magnetometer. The heading is derived from the horizontal projection of the device's "forward"
  * direction, blending the top edge (phone flat) with the camera axis (phone upright), so it stays stable at any
  * tilt instead of spinning wildly near vertical like a plain azimuth would.
+ *
+ * The barometer, when present, is sampled slowly and only polled by the UI's low-rate read-out loop.
  */
 class CompassEngine(context: Context) : SensorEventListener {
 
@@ -31,9 +39,11 @@ class CompassEngine(context: Context) : SensorEventListener {
     private val gravitySensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
         ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val gravityIsRaw = gravitySensor?.type == Sensor.TYPE_ACCELEROMETER
+    private val pressureSensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
 
     val hasCompass: Boolean = magneticSensor != null && (rotationSensor != null || gravitySensor != null)
     val hasLevel: Boolean = gravitySensor != null
+    val hasBarometer: Boolean = pressureSensor != null
 
     // ---- Published state (written on the sensor thread, read on the main thread) -----------------------------
     /** Magnetic heading in degrees, [0, 360). */
@@ -48,8 +58,11 @@ class CompassEngine(context: Context) : SensorEventListener {
         private set
     @Volatile var hasTilt = false
         private set
-    /** Magnetic field magnitude in µT. */
+    /** Magnetic field magnitude in µT, smoothed (raw samples swing by several µT on a resting phone). */
     @Volatile var fieldStrength = 0f
+        private set
+    /** Smoothed atmospheric pressure in hPa; NaN until the first sample (or without a barometer). */
+    @Volatile var pressureHpa = Float.NaN
         private set
     /** One of SensorManager.SENSOR_STATUS_*. */
     @Volatile var accuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
@@ -59,9 +72,43 @@ class CompassEngine(context: Context) : SensorEventListener {
 
     private val updates = Channel<Unit>(Channel.CONFLATED)
 
-    /** Suspends until a new sensor sample has been published. */
-    suspend fun awaitUpdate() {
-        updates.receive()
+    // While the UI is at rest it parks the values it shows here. Samples within the wake thresholds of them are
+    // not forwarded, so a resting phone doesn't wake the main thread at the sensor rate.
+    @Volatile private var parked = false
+    @Volatile private var parkedHeading = 0f
+    @Volatile private var parkedTiltX = 0f
+    @Volatile private var parkedTiltY = 0f
+
+    /**
+     * Suspends until a sample moves past the wake thresholds of the shown values (or may have: a stale wake-up is
+     * possible, so callers re-check). [heading] is magnetic; NaN wakes on the first heading.
+     */
+    suspend fun awaitChange(heading: Float, tiltX: Float, tiltY: Float) {
+        parkedHeading = heading
+        parkedTiltX = tiltX
+        parkedTiltY = tiltY
+        parked = true
+        try {
+            updates.receive()
+        } finally {
+            parked = false
+        }
+    }
+
+    private fun notifyUi() {
+        if (parked && !movedFromParked()) return
+        updates.trySend(Unit)
+    }
+
+    private fun movedFromParked(): Boolean {
+        if (hasHeading) {
+            val h = parkedHeading
+            if (h.isNaN()) return true
+            var d = abs(headingDegrees - h) % 360f
+            if (d > 180f) d = 360f - d
+            if (d >= HEADING_WAKE_DEG) return true
+        }
+        return hasTilt && (abs(tiltX - parkedTiltX) >= TILT_WAKE || abs(tiltY - parkedTiltY) >= TILT_WAKE)
     }
 
     // ---- Sensor-thread-only scratch state (no allocations per event) -----------------------------------------
@@ -90,6 +137,8 @@ class CompassEngine(context: Context) : SensorEventListener {
             sensorManager.registerListener(this, it, if (rotationSensor != null) SensorManager.SENSOR_DELAY_UI else fast, handler)
         }
         gravitySensor?.let { sensorManager.registerListener(this, it, fast, handler) }
+        // Air pressure changes slowly; the normal (~5 Hz) rate is plenty and keeps the sensor near idle.
+        pressureSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler) }
     }
 
     fun stop() {
@@ -108,7 +157,8 @@ class CompassEngine(context: Context) : SensorEventListener {
 
             Sensor.TYPE_MAGNETIC_FIELD -> {
                 geomagnetic[0] = v[0]; geomagnetic[1] = v[1]; geomagnetic[2] = v[2]
-                fieldStrength = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+                val magnitude = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+                fieldStrength = if (fieldStrength == 0f) magnitude else fieldStrength + 0.05f * (magnitude - fieldStrength)
                 accuracy = event.accuracy
                 if (rotationSensor == null && hasGravity &&
                     SensorManager.getRotationMatrix(rotation, null, gravity, geomagnetic)
@@ -129,6 +179,12 @@ class CompassEngine(context: Context) : SensorEventListener {
                 hasGravity = true
                 publishTilt()
             }
+
+            Sensor.TYPE_PRESSURE -> {
+                val p = pressureHpa
+                // Light low-pass: raw samples jitter by a few hundredths of a hPa (~0.3 m of altitude).
+                pressureHpa = if (p.isNaN()) v[0] else p + 0.1f * (v[0] - p)
+            }
         }
     }
 
@@ -144,24 +200,30 @@ class CompassEngine(context: Context) : SensorEventListener {
             else -> rotation
         }
         // Columns of m are the screen axes in world (east, north, up) coordinates.
-        // Forward = horizontal part of the top edge (Y) plus the camera axis (-Z) signed by which way the top tilts;
-        // their horizontal components always point the same way, so the sum never collapses.
-        val sign = if (m[7] >= 0f) 1f else -1f
-        val east = m[1] - sign * m[2]
-        val north = m[4] - sign * m[5]
+        // Forward = horizontal part of the top edge (Y) plus the camera axis (-Z) weighted by how far the top edge
+        // is raised (m[7], signed). Their horizontal parts always point the same way, so the sum never collapses,
+        // and the weight fades to zero as the phone lies flat. (A hard sign switch here made a flat, slightly
+        // rolled phone jump back and forth by up to the roll angle whenever m[7] hovered around zero.)
+        val up = m[7]
+        val east = m[1] - up * m[2]
+        val north = m[4] - up * m[5]
         if (!filterPrimed) {
             filtEast = east; filtNorth = north; filterPrimed = true
         } else {
+            // Adaptive smoothing: sub-degree changes are sensor noise and get filtered hard so a resting phone
+            // reads steady, while real turns (several degrees per sample) pass through at the full rate.
+            val diff = abs(atan2(filtEast * north - filtNorth * east, filtEast * east + filtNorth * north))
+            val k = alpha * (diff / NOISE_BAND_RAD).coerceIn(0.15f, 1f)
             // Filtering the vector (not the angle) avoids any 359° -> 0° wrap-around artefacts.
-            filtEast += alpha * (east - filtEast)
-            filtNorth += alpha * (north - filtNorth)
+            filtEast += k * (east - filtEast)
+            filtNorth += k * (north - filtNorth)
         }
         if (filtEast * filtEast + filtNorth * filtNorth < 1e-6f) return
         var deg = Math.toDegrees(atan2(filtEast, filtNorth).toDouble()).toFloat()
         if (deg < 0f) deg += 360f
         headingDegrees = deg
         hasHeading = true
-        updates.trySend(Unit)
+        notifyUi()
     }
 
     private fun remap(x: Int, y: Int): FloatArray {
@@ -182,6 +244,11 @@ class CompassEngine(context: Context) : SensorEventListener {
             else -> { tiltX = x; tiltY = y }
         }
         hasTilt = true
-        updates.trySend(Unit)
+        notifyUi()
+    }
+
+    private companion object {
+        /** Heading changes below ~3° per sample are treated (progressively) as noise. */
+        const val NOISE_BAND_RAD = 0.05f
     }
 }

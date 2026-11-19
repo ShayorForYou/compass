@@ -23,6 +23,7 @@ import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -42,9 +43,9 @@ import kotlin.math.min
 private val LABELS = arrayOf("N", "30", "60", "E", "120", "150", "S", "210", "240", "W", "300", "330")
 
 /**
- * The rotating dial. Ticks, labels and dots are recorded once into a cached draw and the whole ring is
- * rotated as a hardware layer, so a heading change costs a single layer transform – no recomposition,
- * no re-measurement, no re-draw.
+ * The rotating dial. Ticks, labels and dots are recorded once into a cached draw and rasterised once into an
+ * offscreen layer; the ring is then rotated as that texture, so a heading change costs a single layer
+ * transform – no recomposition, no re-measurement, no re-draw of its ~200 primitives on the GPU.
  */
 @Composable
 fun CompassDial(live: LiveReadings, modifier: Modifier = Modifier) {
@@ -85,6 +86,7 @@ fun CompassDial(live: LiveReadings, modifier: Modifier = Modifier) {
                     scaleX = s
                     scaleY = s
                     alpha = a.coerceIn(0f, 1f)
+                    compositingStrategy = CompositingStrategy.Offscreen
                 }
                 .drawWithCache {
                     val r = size.minDimension / 2f
@@ -190,6 +192,8 @@ fun CompassDial(live: LiveReadings, modifier: Modifier = Modifier) {
                     scaleX = s
                     scaleY = s
                     alpha = a.coerceIn(0f, 1f)
+                    // Rasterise the blurred glow once instead of on every frame the dial turns.
+                    compositingStrategy = CompositingStrategy.Offscreen
                 }
         )
     }

@@ -72,10 +72,13 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.shayor.compass.data.AppSettings
 import com.shayor.compass.location.LocationTracker
+import com.shayor.compass.sensor.AltitudeEstimator
+import com.shayor.compass.sensor.AltitudeReading
 import com.shayor.compass.sensor.CompassEngine
 import com.shayor.compass.ui.theme.LocalCompassColors
 import com.shayor.compass.ui.theme.TabularStyle
 import kotlinx.coroutines.delay
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @Composable
@@ -108,12 +111,21 @@ fun CompassScreen(
     // Low-rate read-outs (4 Hz) – no need to touch these every frame.
     var strength by remember { mutableIntStateOf(0) }
     var accuracy by remember { mutableIntStateOf(engine.accuracy) }
+    var pressure by remember { mutableIntStateOf(0) }
+    var altitude by remember { mutableStateOf<AltitudeReading?>(null) }
+    val altitudeEstimator = remember { AltitudeEstimator() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(engine, lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
-                strength = engine.fieldStrength.roundToInt()
+                // Read-outs hold their shown value until the reading clearly moves, so noise never flickers a digit
+                // (and never costs a redraw on a resting phone).
+                val field = engine.fieldStrength
+                if (abs(field - strength) > 0.8f) strength = field.roundToInt()
                 accuracy = engine.accuracy
+                val hpa = engine.pressureHpa
+                if (!hpa.isNaN() && (pressure == 0 || abs(hpa - pressure) > 0.8f)) pressure = hpa.roundToInt()
+                altitude = altitudeEstimator.update(hpa, tracker.altitude)
                 delay(250)
             }
         }
@@ -140,7 +152,16 @@ fun CompassScreen(
                 onSettingsClick = { showSettings = true },
             )
             Spacer(Modifier.height(20.dp))
-            HeadingBlock(live, strength, useTrueNorth)
+            HeadingBlock(
+                live = live,
+                strength = strength,
+                trueNorth = useTrueNorth,
+                // Without a barometer, altitude can still come from GPS, so the slot exists once location is allowed.
+                showAltitude = engine.hasBarometer || tracker.permissionGranted,
+                altitude = altitude,
+                pressure = if (engine.hasBarometer && pressure > 0) pressure else null,
+                hasBarometer = engine.hasBarometer,
+            )
 
             BoxWithConstraints(
                 Modifier
@@ -174,6 +195,8 @@ fun CompassScreen(
             SettingsSheet(
                 settings = settings,
                 declination = declination,
+                locationGranted = tracker.permissionGranted,
+                onRequestLocation = onRequestLocation,
                 onCalibrate = {
                     showSettings = false
                     showCalibration = true
@@ -219,8 +242,20 @@ private fun TopBar(
 
 // ---- Heading -------------------------------------------------------------------------------------------------
 
+/**
+ * Heading, direction and a quiet line of field strength / north mode. A second line with altitude and air pressure
+ * appears only when the device can produce them, so phones without a barometer or location simply show less.
+ */
 @Composable
-private fun HeadingBlock(live: LiveReadings, strength: Int, trueNorth: Boolean) {
+private fun HeadingBlock(
+    live: LiveReadings,
+    strength: Int,
+    trueNorth: Boolean,
+    showAltitude: Boolean,
+    altitude: AltitudeReading?,
+    pressure: Int?,
+    hasBarometer: Boolean,
+) {
     val c = LocalCompassColors.current
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         val degrees by remember { derivedStateOf { live.heading.roundToInt() % 360 } }
@@ -240,15 +275,38 @@ private fun HeadingBlock(live: LiveReadings, strength: Int, trueNorth: Boolean) 
         Spacer(Modifier.height(10.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             MetaText("$strength µT")
-            Box(
-                Modifier
-                    .padding(horizontal = 10.dp)
-                    .size(3.dp)
-                    .background(c.textMuted.copy(alpha = 0.6f), RoundedCornerShape(50))
-            )
+            MetaDot()
             Crossfade(trueNorth, label = "northMode") { tn -> MetaText(if (tn) "TRUE NORTH" else "MAGNETIC") }
         }
+        if (showAltitude || hasBarometer) {
+            Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (showAltitude) {
+                    // "≈" flags an estimate: barometer not yet anchored by GPS, or a GPS-only height.
+                    MetaText("ALT ${altitude?.let(::formatAltitude) ?: "—"}")
+                }
+                if (showAltitude && hasBarometer) MetaDot()
+                if (hasBarometer) MetaText("PRESSURE ${pressure ?: "—"} hPa")
+            }
+        }
     }
+}
+
+/** "27 m", "≈ 27 m", "≈ −7 m": a spaced "≈" and a true minus sign so an estimate never reads like a typo. */
+private fun formatAltitude(reading: AltitudeReading): String {
+    val value = if (reading.meters < 0) "−${-reading.meters}" else reading.meters.toString()
+    return if (reading.approximate) "≈ $value m" else "$value m"
+}
+
+@Composable
+private fun MetaDot() {
+    val c = LocalCompassColors.current
+    Box(
+        Modifier
+            .padding(horizontal = 10.dp)
+            .size(3.dp)
+            .background(c.textMuted.copy(alpha = 0.6f), RoundedCornerShape(50))
+    )
 }
 
 @Composable
