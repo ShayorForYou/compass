@@ -67,6 +67,13 @@ class CompassEngine(context: Context) : SensorEventListener {
     /** One of SensorManager.SENSOR_STATUS_*. */
     @Volatile var accuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
         private set
+    /**
+     * The fused sensor's own estimate of heading error, in degrees (ROTATION_VECTOR values[4]). NaN when the device
+     * doesn't report one. Unlike [accuracy], which has only four coarse levels and often reads HIGH regardless,
+     * this is the actual uncertainty of the shown heading.
+     */
+    @Volatile var headingErrorDeg = Float.NaN
+        private set
     /** Current display rotation (Surface.ROTATION_*), updated by the UI. */
     @Volatile var displayRotation = Surface.ROTATION_0
 
@@ -127,6 +134,7 @@ class CompassEngine(context: Context) : SensorEventListener {
         if (thread != null) return
         filterPrimed = false
         hasGravity = false
+        headingErrorDeg = Float.NaN
         val t = HandlerThread("compass-sensors", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         thread = t
         val handler = Handler(t.looper)
@@ -152,6 +160,12 @@ class CompassEngine(context: Context) : SensorEventListener {
         when (event.sensor.type) {
             Sensor.TYPE_ROTATION_VECTOR -> {
                 SensorManager.getRotationMatrixFromVector(rotation, v)
+                // values[4] is the estimated heading accuracy in radians; -1 (or 0 on some devices) = not reported.
+                if (v.size > 4 && v[4] > 0f) {
+                    val err = Math.toDegrees(v[4].toDouble()).toFloat()
+                    val e = headingErrorDeg
+                    headingErrorDeg = if (e.isNaN()) err else e + 0.1f * (err - e)
+                }
                 publishHeading(alpha = 0.45f)
             }
 

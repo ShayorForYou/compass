@@ -67,7 +67,8 @@ import kotlin.math.sin
  * watches the reported accuracy, and finishes on its own once accuracy improves to HIGH while it is open.
  */
 @Composable
-fun CalibrationDialog(accuracy: Int, hapticsEnabled: Boolean, onDismiss: () -> Unit) {
+fun CalibrationDialog(state: AccuracyState, hapticsEnabled: Boolean, onDismiss: () -> Unit) {
+    val accuracy = state.level
     val c = LocalCompassColors.current
     val shape = RoundedCornerShape(24.dp)
     val view = LocalView.current
@@ -146,7 +147,30 @@ fun CalibrationDialog(accuracy: Int, hapticsEnabled: Boolean, onDismiss: () -> U
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AccuracyDot(accuracy)
                 Spacer(Modifier.width(6.dp))
-                Text(accuracyLabel(accuracy), color = c.textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Text(accuracyLabel(state), color = c.textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                headingErrorLabel(state.headingErrorDeg)?.let {
+                    Spacer(Modifier.width(6.dp))
+                    Text(it, color = c.textMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                }
+            }
+            fieldComparisonLabel(state)?.let {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (state.expectedUt.isNaN()) "Field $it" else "Field $it expected",
+                    color = c.textMuted,
+                    fontSize = 12.sp,
+                )
+            }
+            if (state.interference) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "The magnetic field here doesn't match Earth's. Move away from metal, magnets and " +
+                        "electronics (or remove a magnetic case), then calibrate again.",
+                    color = c.textSecondary,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                    textAlign = TextAlign.Center,
+                )
             }
             Spacer(Modifier.height(18.dp))
             Text(

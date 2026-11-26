@@ -51,6 +51,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.shayor.compass.ui.theme.LocalCompassColors
+import kotlin.math.roundToInt
+import androidx.compose.runtime.Immutable
+import kotlin.math.abs
 
 // ---- Buttons -------------------------------------------------------------------------------------------------
 
@@ -134,6 +137,77 @@ fun DrawScope.chevronGlyph(color: Color) {
 
 // ---- Accuracy ------------------------------------------------------------------------------------------------
 
+/**
+ * Everything the accuracy read-outs show. [level] is one of SensorManager.SENSOR_STATUS_*, already combining the
+ * OS's coarse status with the checks below, so it can't claim HIGH while the heading is clearly off.
+ */
+@Immutable
+data class AccuracyState(
+    val level: Int,
+    /** Fused sensor's heading-error estimate in degrees; NaN when the device doesn't report one. */
+    val headingErrorDeg: Float = Float.NaN,
+    /** Measured field magnitude, µT (0 = no reading yet). */
+    val fieldUt: Float = 0f,
+    /** Earth's field expected at the current location, µT; NaN without a location fix. */
+    val expectedUt: Float = Float.NaN,
+    /** The measured field doesn't look like Earth's: nearby magnets/metal, or a badly calibrated magnetometer. */
+    val interference: Boolean = false,
+)
+
+// Earth's field is ~22–67 µT everywhere; outside that (with a margin) it can't be the bare geomagnetic field.
+private const val EARTH_MIN_UT = 20f
+private const val EARTH_MAX_UT = 70f
+// Relative gap from the expected field at which the heading becomes suspect / unusable. The model (WMM) itself is
+// good to ~1%, so anything past these is local distortion or miscalibration.
+private const val FIELD_GAP_MEDIUM = 0.10f
+private const val FIELD_GAP_BAD = 0.20f
+private const val FIELD_GAP_CLEAR = 0.17f // hysteresis: interference clears only below this
+
+fun assessAccuracy(
+    status: Int,
+    headingErrorDeg: Float,
+    fieldUt: Float,
+    expectedUt: Float,
+    wasInterference: Boolean,
+): AccuracyState {
+    var level = status
+    if (!headingErrorDeg.isNaN()) {
+        level = minOf(
+            level,
+            when {
+                headingErrorDeg <= 5f -> SensorManager.SENSOR_STATUS_ACCURACY_HIGH
+                headingErrorDeg <= 15f -> SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM
+                else -> SensorManager.SENSOR_STATUS_ACCURACY_LOW
+            },
+        )
+    }
+    var interference = false
+    if (fieldUt > 0f) {
+        if (!expectedUt.isNaN() && expectedUt > 0f) {
+            val gap = abs(fieldUt - expectedUt) / expectedUt
+            interference = gap > (if (wasInterference) FIELD_GAP_CLEAR else FIELD_GAP_BAD)
+            if (gap > FIELD_GAP_MEDIUM) level = minOf(level, SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM)
+        } else {
+            interference = fieldUt < EARTH_MIN_UT || fieldUt > EARTH_MAX_UT
+        }
+        if (interference) level = minOf(level, SensorManager.SENSOR_STATUS_ACCURACY_LOW)
+    }
+    return AccuracyState(level, headingErrorDeg, fieldUt, expectedUt, interference)
+}
+
+/** "±4°", or null when the device reports no heading-error estimate. */
+fun headingErrorLabel(headingErrorDeg: Float): String? =
+    if (headingErrorDeg.isNaN()) null else "±${headingErrorDeg.roundToInt().coerceAtLeast(1)}°"
+
+fun accuracyLabel(state: AccuracyState) = if (state.interference) "Interference" else accuracyLabel(state.level)
+
+/** "31 / 44 µT" (measured / expected), "31 µT" without a location, or null before the first reading. */
+fun fieldComparisonLabel(state: AccuracyState): String? = when {
+    state.fieldUt <= 0f -> null
+    state.expectedUt.isNaN() -> "${state.fieldUt.roundToInt()} µT"
+    else -> "${state.fieldUt.roundToInt()} / ${state.expectedUt.roundToInt()} µT"
+}
+
 fun accuracyLabel(accuracy: Int) = when (accuracy) {
     SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "High accuracy"
     SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "Medium accuracy"
@@ -179,7 +253,7 @@ fun AccuracyDot(accuracy: Int, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun AccuracyPill(accuracy: Int, onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun AccuracyPill(state: AccuracyState, onClick: () -> Unit, modifier: Modifier = Modifier) {
     val c = LocalCompassColors.current
     val pill = RoundedCornerShape(50)
     Row(
@@ -192,14 +266,19 @@ fun AccuracyPill(accuracy: Int, onClick: () -> Unit, modifier: Modifier = Modifi
             .padding(start = 9.dp, end = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        AccuracyDot(accuracy)
+        AccuracyDot(state.level)
         Spacer(Modifier.width(6.dp))
         Text(
-            accuracyLabel(accuracy),
+            accuracyLabel(state),
             color = c.textSecondary,
             fontSize = 12.sp,
             fontWeight = FontWeight.Medium,
         )
+        // Interference trumps the ± estimate: the fused sensor doesn't know the field it trusts is distorted.
+        (if (state.interference) fieldComparisonLabel(state) else headingErrorLabel(state.headingErrorDeg))?.let {
+            Spacer(Modifier.width(6.dp))
+            Text(it, color = c.textMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
     }
 }
 

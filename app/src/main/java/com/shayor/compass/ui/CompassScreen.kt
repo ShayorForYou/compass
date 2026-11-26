@@ -46,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -98,31 +99,43 @@ fun CompassScreen(
     SideEffect { engine.displayRotation = view.display?.rotation ?: Surface.ROTATION_0 }
 
     val location = tracker.location
-    val declination = remember(location) {
+    val geoField = remember(location) {
         location?.let {
             GeomagneticField(
                 it.latitude.toFloat(), it.longitude.toFloat(), it.altitude.toFloat(), System.currentTimeMillis(),
-            ).declination
+            )
         }
     }
+    val declination = geoField?.declination
+    // Earth's field strength expected here (WMM, nT -> µT), to spot local distortion the OS status misses.
+    val expectedField = geoField?.fieldStrength?.div(1000f) ?: Float.NaN
     val useTrueNorth = settings.trueNorth && declination != null
     SensorAnimationLoop(engine, live, if (useTrueNorth) declination else 0f, settings.haptics)
 
     // Low-rate read-outs (4 Hz) – no need to touch these every frame.
     var strength by remember { mutableIntStateOf(0) }
-    var accuracy by remember { mutableIntStateOf(engine.accuracy) }
+    var accuracy by remember { mutableStateOf(AccuracyState(engine.accuracy)) }
+    val expected by rememberUpdatedState(expectedField)
     var pressure by remember { mutableIntStateOf(0) }
     var altitude by remember { mutableStateOf<AltitudeReading?>(null) }
     val altitudeEstimator = remember { AltitudeEstimator() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(engine, lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var headingError = Float.NaN
             while (true) {
                 // Read-outs hold their shown value until the reading clearly moves, so noise never flickers a digit
                 // (and never costs a redraw on a resting phone).
                 val field = engine.fieldStrength
                 if (abs(field - strength) > 0.8f) strength = field.roundToInt()
-                accuracy = engine.accuracy
+                val err = engine.headingErrorDeg
+                // Hold the shown value until it moves by a whole degree, so the read-out doesn't flicker.
+                if (err.isNaN() != headingError.isNaN() || abs(err - headingError) >= 1f) headingError = err
+                // Judged on the held strength, so the state (and composition) only changes when a shown value does.
+                val next = assessAccuracy(
+                    engine.accuracy, headingError, strength.toFloat(), expected, accuracy.interference,
+                )
+                if (next != accuracy) accuracy = next
                 val hpa = engine.pressureHpa
                 if (!hpa.isNaN() && (pressure == 0 || abs(hpa - pressure) > 0.8f)) pressure = hpa.roundToInt()
                 altitude = altitudeEstimator.update(hpa, tracker.altitude)
@@ -214,7 +227,7 @@ fun CompassScreen(
 
 @Composable
 private fun TopBar(
-    accuracy: Int,
+    accuracy: AccuracyState,
     onAccuracyClick: () -> Unit,
     settingsOpen: Boolean,
     onSettingsClick: () -> Unit,
